@@ -1,4 +1,5 @@
 import type { PcmBuffer } from './types';
+import { fftInPlace } from './fft';
 
 /**
  * 接缝频谱检查：对循环 PCM（buildLoopPcm 的输出，与试听 / 导出口径一致）
@@ -56,67 +57,6 @@ export interface SeamSpectrumResult {
 
 /** 频带能量下限：约 −120 dB，避免静音时取对数得到 −Infinity */
 const EPS = 1e-12;
-
-/** 每个 fftSize 的位反转表与旋转因子缓存（STFT 会反复调用同尺寸 FFT） */
-interface FftTables {
-  rev: Uint32Array;
-  cos: Float32Array;
-  sin: Float32Array;
-}
-const fftCache = new Map<number, FftTables>();
-
-function getFftTables(n: number): FftTables {
-  const cached = fftCache.get(n);
-  if (cached) return cached;
-  const bits = Math.round(Math.log2(n));
-  const rev = new Uint32Array(n);
-  for (let i = 1; i < n; i++) rev[i] = (rev[i >> 1] >> 1) | ((i & 1) << (bits - 1));
-  const cos = new Float32Array(n / 2);
-  const sin = new Float32Array(n / 2);
-  for (let k = 0; k < n / 2; k++) {
-    const a = (-2 * Math.PI * k) / n;
-    cos[k] = Math.cos(a);
-    sin[k] = Math.sin(a);
-  }
-  const tables: FftTables = { rev, cos, sin };
-  fftCache.set(n, tables);
-  return tables;
-}
-
-/** 就地基-2 FFT（re / im 长度 n，n 为 2 的幂） */
-function fftInPlace(re: Float32Array, im: Float32Array): void {
-  const n = re.length;
-  const { rev, cos, sin } = getFftTables(n);
-  for (let i = 0; i < n; i++) {
-    const j = rev[i];
-    if (j > i) {
-      const tr = re[i];
-      re[i] = re[j];
-      re[j] = tr;
-      const ti = im[i];
-      im[i] = im[j];
-      im[j] = ti;
-    }
-  }
-  for (let len = 2; len <= n; len <<= 1) {
-    const half = len >> 1;
-    const step = n / len;
-    for (let i = 0; i < n; i += len) {
-      for (let k = 0; k < half; k++) {
-        const wr = cos[k * step];
-        const wi = sin[k * step];
-        const a = i + k;
-        const b = a + half;
-        const xr = re[b] * wr - im[b] * wi;
-        const xi = re[b] * wi + im[b] * wr;
-        re[b] = re[a] - xr;
-        im[b] = im[a] - xi;
-        re[a] += xr;
-        im[a] += xi;
-      }
-    }
-  }
-}
 
 /**
  * 计算片段 [from, from+win) 的 STFT 频带能量（dB），返回 energies[frame][band]。

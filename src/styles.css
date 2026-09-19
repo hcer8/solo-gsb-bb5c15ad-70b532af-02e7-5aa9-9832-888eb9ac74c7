@@ -262,6 +262,111 @@ button.active {
   color: #9aa7bd;
 }
 
+/* 周期校准面板 */
+.period-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.period-head h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  flex: 1;
+}
+
+.period-desc {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
+.period-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.period-table th,
+.period-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #232c40;
+}
+
+.period-table th {
+  color: #9aa7bd;
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.period-table tbody tr {
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.period-table tbody tr:hover {
+  background: rgba(91, 141, 239, 0.08);
+}
+
+.period-table tbody tr.selected {
+  background: rgba(91, 141, 239, 0.12);
+}
+
+.period-table tbody tr.selected td {
+  color: #9fc0ff;
+}
+
+.period-table .rank {
+  background: rgba(91, 141, 239, 0.16);
+  color: #9fc0ff;
+}
+
+.period-table tr.selected .rank {
+  background: #5b8def;
+  color: #0b1a33;
+}
+
+.conf {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.conf-bar {
+  display: inline-block;
+  width: 72px;
+  height: 6px;
+  border-radius: 3px;
+  background: #1b2338;
+  overflow: hidden;
+}
+
+.conf-bar span {
+  display: block;
+  height: 100%;
+  background: #5b8def;
+}
+
+.period-meta {
+  margin: 8px 2px 0;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
+.lock-note {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: #7fe6b0;
+  background: rgba(47, 210, 125, 0.08);
+  border: 1px solid rgba(47, 210, 125, 0.3);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
 /* 接缝频谱检查面板 */
 .spectrum h2 {
   margin: 0 0 8px;

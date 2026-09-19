@@ -9,6 +9,11 @@ export interface SeamSearchOptions {
   slopeWeight?: number;
   /** 允许的最短循环长度（采样点），默认 64 */
   minLoopSamples?: number;
+  /**
+   * 定长约束（采样点）：设置后循环长度固定为该值，起止点只能等量平移
+   * （周期校准锁定模式）；小于 minLoopSamples 时忽略，退化为自由搜索
+   */
+  fixedLoopSamples?: number;
 }
 
 export interface CandidateSearchOptions extends SeamSearchOptions {
@@ -31,6 +36,36 @@ export interface SeamResult {
 }
 
 /**
+ * 计数排序：按代价升序返回索引。
+ * 代价量化为 65536 个桶，同桶内顺序不重要——最终候选会按精确代价重排；
+ * 相比对 ~30 万元素做比较器排序（数百毫秒），计数排序只需几毫秒。
+ */
+function orderByCost(costs: ArrayLike<number>): Uint32Array {
+  const n = costs.length;
+  let minC = Infinity;
+  let maxC = -Infinity;
+  for (let k = 0; k < n; k++) {
+    const c = costs[k];
+    if (c < minC) minC = c;
+    if (c > maxC) maxC = c;
+  }
+  const BUCKETS = 65536;
+  const bucketScale = (BUCKETS - 1) / (maxC - minC || 1);
+  const bucketOf = (k: number): number => ((costs[k] - minC) * bucketScale) | 0;
+  const offsets = new Uint32Array(BUCKETS);
+  for (let k = 0; k < n; k++) offsets[bucketOf(k)]++;
+  let acc = 0;
+  for (let b = 0; b < BUCKETS; b++) {
+    const cnt = offsets[b];
+    offsets[b] = acc;
+    acc += cnt;
+  }
+  const order = new Uint32Array(n);
+  for (let k = 0; k < n; k++) order[offsets[bucketOf(k)]++] = k;
+  return order;
+}
+
+/**
  * 在用户粗选的两个边界附近搜索代价最低的若干接缝点对（候选对比模式）。
  *
  * 接缝代价 = Σ声道 ( |x[s] − x[e−1]| / RMS幅值
@@ -45,6 +80,10 @@ export interface SeamResult {
  * 避免列表被同一个低谷占满；再对每个粗候选在 ±stride 内逐采样点细化。
  * 细化后再次去重并按代价排序，返回前 maxCandidates 个结果
  * （按代价升序，第 0 个即最优接缝）。
+ *
+ * 定长模式（options.fixedLoopSamples ≥ minLoopSamples，周期校准锁定）：
+ * 循环长度固定，起止点只能等量平移，搜索退化为一维——对半径内每个
+ * 平移量逐采样点评估代价，同样经过去重后按代价升序返回候选。
  */
 export function findCandidateSeams(
   audio: AudioDataLike,
@@ -84,6 +123,50 @@ export function findCandidateSeams(
   const lo = W + 1;
   const hi = len - W - 2;
   const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(v, b));
+
+  // ---- 定长模式：循环长度固定为 fixedLoopSamples，起止点等量平移（一维搜索）----
+  const fixedLoop = Math.round(options.fixedLoopSamples ?? 0);
+  if (fixedLoop >= minLoop) {
+    // e = s + fixedLoop，要求 s ∈ [lo, hi] 且 e ∈ [lo+1, len−1]
+    const sLoF = Math.max(lo, Math.round(roughStart) - r, lo + 1 - fixedLoop);
+    const sHiF = Math.min(hi, Math.round(roughStart) + r, len - 1 - fixedLoop);
+    const count = sHiF - sLoF + 1;
+    if (count <= 0) return [];
+
+    // 每个平移位置的接缝代价（特征与自由模式同口径：归一化幅值 + 短窗斜率）
+    const costs = new Float32Array(count);
+    for (let c = 0; c < nCh; c++) {
+      const x = data[c];
+      for (let i = 0; i < count; i++) {
+        const s = sLoF + i;
+        const e = s + fixedLoop;
+        costs[i] += Math.abs(x[s] / rmsV - x[e - 1] / rmsV);
+        costs[i] += slopeWeight * Math.abs((x[s + W] - x[s]) / W / rmsD - (x[e - 1] - x[e - 1 - W]) / W / rmsD);
+      }
+    }
+
+    // 按代价升序贪心挑选互不重复的候选（一维下起止点平移量相同，
+    // 起点相距不足 dedup 即等价于整段重合）
+    const order = orderByCost(costs);
+    const result: SeamResult[] = [];
+    for (let o = 0; o < count; o++) {
+      const k = order[o];
+      const s = sLoF + k;
+      let dup = false;
+      for (const p of result) {
+        if (Math.abs(p.startSample - s) < dedup) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      result.push({ startSample: s, endSample: s + fixedLoop, cost: costs[k] });
+      if (result.length >= maxCandidates) break;
+    }
+    return result;
+  }
+
+  // ---- 自由模式候选范围 ----
   const sLo = clamp(Math.round(roughStart) - r, lo, hi);
   const sHi = clamp(Math.round(roughStart) + r, lo, hi);
   const eLo = clamp(Math.round(roughEnd) - r, lo + 1, len - 1);
@@ -147,30 +230,9 @@ export function findCandidateSeams(
   }
   if (hitCost.length === 0) return [];
 
-  // ---- 计数排序：按代价升序排列命中索引。
-  // 代价量化为 65536 个桶，同桶内顺序不重要——最终候选在细化后会按精确代价重排；
-  // 相比对 ~30 万元素做比较器排序（数百毫秒），计数排序只需几毫秒 ----
+  // ---- 按代价升序排列命中索引（计数排序，见 orderByCost）----
   const hitCount = hitCost.length;
-  let minC = Infinity;
-  let maxC = -Infinity;
-  for (let k = 0; k < hitCount; k++) {
-    const c = hitCost[k];
-    if (c < minC) minC = c;
-    if (c > maxC) maxC = c;
-  }
-  const BUCKETS = 65536;
-  const bucketScale = (BUCKETS - 1) / (maxC - minC || 1);
-  const bucketOf = (k: number): number => ((hitCost[k] - minC) * bucketScale) | 0;
-  const offsets = new Uint32Array(BUCKETS);
-  for (let k = 0; k < hitCount; k++) offsets[bucketOf(k)]++;
-  let acc = 0;
-  for (let b = 0; b < BUCKETS; b++) {
-    const n = offsets[b];
-    offsets[b] = acc;
-    acc += n;
-  }
-  const order = new Uint32Array(hitCount);
-  for (let k = 0; k < hitCount; k++) order[offsets[bucketOf(k)]++] = k;
+  const order = orderByCost(hitCost);
 
   // ---- 贪心挑选互不重复的粗候选（多取一些，为细化后的合并留出余量）----
   const poolSize = Math.max(maxCandidates * 3, 6);

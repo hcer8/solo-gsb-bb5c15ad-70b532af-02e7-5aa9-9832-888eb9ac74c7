@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Waveform, type Region, type SeamMarker } from './components/Waveform';
 import { SeamSpectrumPanel } from './components/SeamSpectrumPanel';
+import { PeriodPanel, PERIOD_REASON_TEXT, type PeriodLock } from './components/PeriodPanel';
 import { LoopPlayer } from './audio/player';
 import { decodeAudioFile } from './audio/decode';
 import { findCandidateSeams, type SeamResult } from './audio/loopFinder';
+import { detectPeriods, type PeriodCandidate, type PeriodDetectFailure } from './audio/periodDetect';
 import { buildLoopPcm } from './audio/loopBuffer';
 import { analyzeSeamSpectrum } from './audio/seamSpectrum';
 import { encodeWav, wavFileSize } from './audio/wavExport';
@@ -37,6 +39,11 @@ export default function App() {
   const [status, setStatus] = useState('请导入 WAV / MP3 音频文件（音频仅在本地浏览器处理，不会上传）。');
   const [busy, setBusy] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  // 周期校准：候选列表、失败原因、滞后范围与锁定状态
+  const [periodCandidates, setPeriodCandidates] = useState<PeriodCandidate[]>([]);
+  const [periodReason, setPeriodReason] = useState<PeriodDetectFailure | null>(null);
+  const [periodLagRange, setPeriodLagRange] = useState<{ min: number; max: number } | null>(null);
+  const [periodLock, setPeriodLock] = useState<PeriodLock | null>(null);
   const playerRef = useRef<LoopPlayer | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -80,6 +87,10 @@ export default function App() {
       setSelection(null);
       setCandidates([]);
       setSelectedIdx(0);
+      setPeriodCandidates([]);
+      setPeriodReason(null);
+      setPeriodLagRange(null);
+      setPeriodLock(null);
       setStatus(
         `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。请在波形上框选大致循环区间。`,
       );
@@ -105,10 +116,79 @@ export default function App() {
 
   const onSelectionChange = useCallback((region: Region) => {
     setSelection(region);
-    // 选区变化后旧候选失效：清空候选并禁用导出
+    // 选区变化后旧候选失效：清空候选并禁用导出；
+    // 滞后范围随选区长度变化，周期候选与锁定一并清除
     setCandidates([]);
     setSelectedIdx(0);
+    setPeriodCandidates([]);
+    setPeriodReason(null);
+    setPeriodLagRange(null);
+    setPeriodLock(null);
   }, []);
+
+  /** 周期校准：分析整段音频的能量变化包络，给出前 3 个周期候选 */
+  const runPeriodAnalysis = useCallback(() => {
+    if (!buffer || !selection) {
+      setStatus('请先在波形上框选大致循环区间，再进行周期校准分析。');
+      return;
+    }
+    const sr = buffer.sampleRate;
+    const res = detectPeriods(buffer, (selection.end - selection.start) * sr);
+    setPeriodCandidates(res.candidates);
+    setPeriodReason(res.reason);
+    setPeriodLagRange(res.lagRangeSamples);
+    setPeriodLock(null);
+    if (res.candidates.length === 0) {
+      // 短音频 / 静音 / 无显著峰：不强制吸附，提示原因并保留原选区
+      setStatus(`周期校准：${PERIOD_REASON_TEXT[res.reason ?? 'no-peak']}已保留原选区。`);
+      return;
+    }
+    const range = res.lagRangeSamples;
+    setStatus(
+      `周期校准：在 ${((range?.min ?? 0) / sr * 1000).toFixed(0)}～${((range?.max ?? 0) / sr * 1000).toFixed(0)} ms ` +
+        `滞后范围内检测到 ${res.candidates.length} 个周期候选。点击候选可将选区终点吸附到该周期，并把接缝搜索切换为定长约束。`,
+    );
+  }, [buffer, selection]);
+
+  /** 点选周期候选：选区终点吸附到该周期，接缝搜索切换为定长约束 */
+  const snapToPeriod = useCallback(
+    (idx: number) => {
+      if (!buffer || !selection) return;
+      const cand = periodCandidates[idx];
+      if (!cand) return;
+      const sr = buffer.sampleRate;
+      const periodSec = cand.periodSamples / sr;
+      let start = selection.start;
+      let end = start + periodSec;
+      if (end > buffer.duration) {
+        // 终点越界时整体左移选区，保持周期长度不变
+        end = buffer.duration;
+        start = Math.max(0, end - periodSec);
+      }
+      setSelection({ start, end });
+      setPeriodLock({ periodSamples: cand.periodSamples, confidence: cand.confidence, rank: idx + 1 });
+      // 选区已变，旧接缝候选失效
+      setCandidates([]);
+      setSelectedIdx(0);
+      setStatus(
+        `已吸附到周期候选 #${idx + 1}：周期 ${(periodSec * 1000).toFixed(1)} ms，置信度 ${(cand.confidence * 100).toFixed(0)}%。` +
+          ` 接缝搜索已切换为定长约束（起止点等量平移，周期样本数不变），请重新查找候选接缝。`,
+      );
+    },
+    [buffer, selection, periodCandidates],
+  );
+
+  /** 解除周期锁定：恢复自由起止点搜索，旧候选需重新查找 */
+  const clearPeriodLock = useCallback(() => {
+    setPeriodLock(null);
+    if (candidates.length > 0) {
+      setCandidates([]);
+      setSelectedIdx(0);
+      setStatus('已解除周期锁定：接缝搜索恢复为自由起止点模式，候选已清空，请重新查找。');
+    } else {
+      setStatus('已解除周期锁定：接缝搜索恢复为自由起止点模式。');
+    }
+  }, [candidates.length]);
 
   /** 搜索半径变化：清空候选并禁用旧导出，需重新查找 */
   const onRadiusChange = (v: number) => {
@@ -140,6 +220,8 @@ export default function App() {
       slopeWindow: SLOPE_WINDOW,
       slopeWeight: SLOPE_WEIGHT,
       maxCandidates: MAX_CANDIDATES,
+      // 周期锁定后使用定长约束：起止点等量平移，周期样本数不变
+      fixedLoopSamples: periodLock?.periodSamples,
     });
     setCandidates(found);
     setSelectedIdx(0);
@@ -150,14 +232,18 @@ export default function App() {
     const best = found[0];
     const dStart = ((best.startSample - startS) / sr) * 1000;
     const dEnd = ((best.endSample - endS) / sr) * 1000;
+    const shiftText = periodLock
+      ? ` #1 起止点同步移动 ${dStart >= 0 ? '+' : ''}${dStart.toFixed(1)} ms（定长约束），`
+      : ` #1 起点移动 ${dStart >= 0 ? '+' : ''}${dStart.toFixed(1)} ms，` +
+        `终点移动 ${dEnd >= 0 ? '+' : ''}${dEnd.toFixed(1)} ms，`;
     setStatus(
       `找到 ${found.length} 个候选接缝（起止点相距不足 10 ms 的已去重，按代价排序）。` +
-        ` #1 起点移动 ${dStart >= 0 ? '+' : ''}${dStart.toFixed(1)} ms，` +
-        `终点移动 ${dEnd >= 0 ? '+' : ''}${dEnd.toFixed(1)} ms，代价 ${best.cost.toFixed(4)}。` +
+        shiftText +
+        `代价 ${best.cost.toFixed(4)}。` +
         ` 点击候选列表可切换试听与导出目标。`,
     );
     return found;
-  }, [buffer, selection, radiusMs]);
+  }, [buffer, selection, radiusMs, periodLock]);
 
   const playOriginal = useCallback(async () => {
     if (!buffer || !selection) {
@@ -258,6 +344,13 @@ export default function App() {
         slopeWeight: SLOPE_WEIGHT,
       },
       seamCost: seam.cost,
+      // 周期校准：锁定的周期与置信度；fixedLengthSearch 标记接缝搜索是否为定长约束
+      periodCalibration: {
+        fixedLengthSearch: periodLock !== null,
+        periodSec: periodLock ? roundTo(periodLock.periodSamples / sr, 6) : null,
+        periodSamples: periodLock ? periodLock.periodSamples : null,
+        confidence: periodLock ? periodLock.confidence : null,
+      },
       // 接缝频谱诊断：参数与结果（差值矩阵为 头 − 尾，帧按与接缝的距离配对）
       spectrumDiagnostics: spectrum
         ? {
@@ -298,8 +391,8 @@ export default function App() {
     a.download = `${fileName.replace(/\.[^.]+$/, '') || 'loop'}.loop.json`;
     a.click();
     URL.revokeObjectURL(url);
-    setStatus(`已导出 JSON：候选 #${selectedIdx + 1} 的起止时间、全部候选列表、搜索参数与接缝频谱诊断。`);
-  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs]);
+    setStatus(`已导出 JSON：候选 #${selectedIdx + 1} 的起止时间、全部候选列表、搜索参数、周期校准与接缝频谱诊断。`);
+  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, periodLock]);
 
   const exportWav = useCallback(() => {
     if (!buffer || !seam) return;
@@ -343,7 +436,7 @@ export default function App() {
     <div className="app">
       <header className="header">
         <h1>无缝循环接缝查找器</h1>
-        <p>本地浏览器内分析音频，在粗选边界附近搜索幅值与短窗斜率最连续的接缝候选（Top 5 按代价排序），可点选对比试听、查看接缝频谱诊断热图并导出参数。</p>
+        <p>本地浏览器内分析音频：周期校准可按能量包络自相关吸附选区到整周期，接缝搜索在粗选边界附近寻找幅值与短窗斜率最连续的接缝候选（Top 5 按代价排序，锁定周期后为定长约束），可点选对比试听、查看接缝频谱诊断热图并导出参数。</p>
       </header>
 
       <section
@@ -374,6 +467,18 @@ export default function App() {
             <span><i className="swatch swatch-handle" /> 选区边界（可拖动）</span>
             <span><i className="swatch swatch-seam" /> 候选接缝（编号与列表对应，高亮为选中）</span>
           </div>
+
+          <PeriodPanel
+            candidates={periodCandidates}
+            reason={periodReason}
+            lagRange={periodLagRange}
+            lock={periodLock}
+            sampleRate={sr}
+            hasSelection={selection !== null}
+            onAnalyze={runPeriodAnalysis}
+            onPick={snapToPeriod}
+            onClearLock={clearPeriodLock}
+          />
 
           <section className="panel">
             <div className="sliders">
