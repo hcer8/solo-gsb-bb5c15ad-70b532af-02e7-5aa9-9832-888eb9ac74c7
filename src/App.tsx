@@ -4,6 +4,7 @@ import { SeamSpectrumPanel } from './components/SeamSpectrumPanel';
 import { LoopPlayer } from './audio/player';
 import { decodeAudioFile } from './audio/decode';
 import { findCandidateSeams, type SeamResult } from './audio/loopFinder';
+import { detectPeriods, type PeriodCandidate, type PeriodDetectFailure } from './audio/periodDetect';
 import { buildLoopPcm } from './audio/loopBuffer';
 import { analyzeSeamSpectrum } from './audio/seamSpectrum';
 import { encodeWav, wavFileSize } from './audio/wavExport';
@@ -14,6 +15,8 @@ const SLOPE_WEIGHT = 1;
 const MIN_LOOP_SECONDS = 0.05;
 /** 候选接缝数量（按代价升序） */
 const MAX_CANDIDATES = 5;
+/** 周期候选数量（按置信度降序） */
+const MAX_PERIOD_CANDIDATES = 3;
 
 /** 保留 decimals 位小数的有限数值（防御 NaN / Infinity 进入 JSON） */
 const roundTo = (x: number, decimals: number): number => {
@@ -37,11 +40,19 @@ export default function App() {
   const [status, setStatus] = useState('请导入 WAV / MP3 音频文件（音频仅在本地浏览器处理，不会上传）。');
   const [busy, setBusy] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  // 周期校准：候选列表、无候选原因、已吸附的候选（定长约束生效中）、吸附前的选区
+  const [periodCandidates, setPeriodCandidates] = useState<PeriodCandidate[]>([]);
+  const [periodFailure, setPeriodFailure] = useState<PeriodDetectFailure | null>(null);
+  const [appliedPeriod, setAppliedPeriod] = useState<PeriodCandidate | null>(null);
+  const [preSnapSelection, setPreSnapSelection] = useState<Region | null>(null);
   const playerRef = useRef<LoopPlayer | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 当前选中的候选接缝：「试听选中候选」与 JSON / WAV 导出的目标
   const seam = candidates[selectedIdx] ?? null;
+
+  // 定长约束的循环长度（采样点）；未吸附周期时为 null（自由搜索）
+  const fixedLoopSamples = appliedPeriod ? Math.round(appliedPeriod.periodSamples) : null;
 
   // 接缝频谱检查：当前候选的循环 PCM（与试听 / 导出口径一致，含交叉淡化），
   // 切换候选或调整交叉淡化时自动重建，频谱分析随之实时重算
@@ -80,6 +91,10 @@ export default function App() {
       setSelection(null);
       setCandidates([]);
       setSelectedIdx(0);
+      setPeriodCandidates([]);
+      setPeriodFailure(null);
+      setAppliedPeriod(null);
+      setPreSnapSelection(null);
       setStatus(
         `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。请在波形上框选大致循环区间。`,
       );
@@ -103,12 +118,100 @@ export default function App() {
     if (file) void handleFile(file);
   };
 
-  const onSelectionChange = useCallback((region: Region) => {
-    setSelection(region);
-    // 选区变化后旧候选失效：清空候选并禁用导出
+  const onSelectionChange = useCallback(
+    (region: Region) => {
+      setSelection(region);
+      // 选区变化后旧候选失效：清空候选并禁用导出
+      setCandidates([]);
+      setSelectedIdx(0);
+      // 周期候选基于旧选区长度（滞后范围随之变化），一并清空
+      setPeriodCandidates([]);
+      setPeriodFailure(null);
+      // 手动改变选区长度即解除定长约束（吸附前的选区记录同时作废）
+      if (appliedPeriod && buffer) {
+        const sr = buffer.sampleRate;
+        const lenSamples = (region.end - region.start) * sr;
+        if (Math.abs(lenSamples - appliedPeriod.periodSamples) > Math.max(2, sr * 0.0005)) {
+          setAppliedPeriod(null);
+          setPreSnapSelection(null);
+          setStatus('选区长度已改变，定长约束已解除；如需周期校准请重新分析。');
+        }
+      }
+    },
+    [appliedPeriod, buffer],
+  );
+
+  /** 周期校准：分析整段音频的能量变化包络，给出前 3 个周期候选 */
+  const analyzePeriod = useCallback(() => {
+    if (!buffer || !selection) {
+      setStatus('请先在波形上框选大致循环区间，再进行周期校准。');
+      return;
+    }
+    const res = detectPeriods(buffer, selection.start, selection.end, {
+      maxCandidates: MAX_PERIOD_CANDIDATES,
+    });
+    setPeriodCandidates(res.candidates);
+    setPeriodFailure(res.failure);
+    if (res.failure === 'too-short') {
+      setStatus('周期校准：音频太短，可用范围内无法搜索选区长度 1/2～2 倍的滞后，已保留原选区。');
+    } else if (res.failure === 'silence') {
+      setStatus('周期校准：音频接近静音（帧能量低于 −80 dBFS），无法提取能量变化包络，已保留原选区。');
+    } else if (res.failure === 'no-peak') {
+      setStatus(
+        `周期校准：未找到显著周期峰（最强归一化自相关 ${res.maxCorrelation.toFixed(2)}，阈值 0.30），已保留原选区。`,
+      );
+    } else {
+      setStatus(
+        `周期校准：找到 ${res.candidates.length} 个周期候选（已抑制整数倍/分频重复峰，按置信度排序）。` +
+          ` 点击候选将选区终点吸附到该周期，接缝搜索切换为定长约束。`,
+      );
+    }
+  }, [buffer, selection]);
+
+  /** 解除定长约束：恢复吸附前选区，接缝搜索回到自由模式 */
+  const releasePeriod = useCallback(() => {
+    if (!appliedPeriod) return;
+    if (preSnapSelection) setSelection(preSnapSelection);
+    setPreSnapSelection(null);
+    setAppliedPeriod(null);
     setCandidates([]);
     setSelectedIdx(0);
-  }, []);
+    setStatus('已解除定长约束并恢复吸附前选区，接缝搜索恢复为自由模式。');
+  }, [appliedPeriod, preSnapSelection]);
+
+  /** 选择周期候选：选区终点吸附到该周期，接缝搜索切换为定长约束；再次点击已吸附候选则解除 */
+  const applyPeriod = useCallback(
+    (cand: PeriodCandidate) => {
+      if (!buffer || !selection) return;
+      if (appliedPeriod === cand) {
+        releasePeriod();
+        return;
+      }
+      const sr = buffer.sampleRate;
+      const periodSec = cand.periodSamples / sr;
+      const newEnd = selection.start + periodSec;
+      if (newEnd > buffer.duration + 1e-9) {
+        setStatus(
+          `周期 ${(periodSec * 1000).toFixed(1)} ms 超出音频末尾，无法吸附，已保留原选区。`,
+        );
+        return;
+      }
+      if (!appliedPeriod) setPreSnapSelection(selection);
+      const dEnd = (newEnd - selection.end) * 1000;
+      setSelection({ start: selection.start, end: newEnd });
+      setAppliedPeriod(cand);
+      // 选区已变：旧接缝候选失效
+      setCandidates([]);
+      setSelectedIdx(0);
+      setStatus(
+        `已吸附到周期：终点平移 ${dEnd >= 0 ? '+' : ''}${dEnd.toFixed(1)} ms，` +
+          `选区长度 = ${(periodSec * 1000).toFixed(1)} ms（${Math.round(cand.periodSamples).toLocaleString()} 采样点，` +
+          `置信度 ${(cand.confidence * 100).toFixed(0)}%）。` +
+          ` 接缝搜索已切换为定长约束：起止点等量平移，周期样本数不变。`,
+      );
+    },
+    [buffer, selection, appliedPeriod, releasePeriod],
+  );
 
   /** 搜索半径变化：清空候选并禁用旧导出，需重新查找 */
   const onRadiusChange = (v: number) => {
@@ -140,16 +243,31 @@ export default function App() {
       slopeWindow: SLOPE_WINDOW,
       slopeWeight: SLOPE_WEIGHT,
       maxCandidates: MAX_CANDIDATES,
+      fixedLoopSamples: fixedLoopSamples ?? undefined,
     });
     setCandidates(found);
     setSelectedIdx(0);
     if (found.length === 0) {
-      setStatus('未找到有效接缝：请调整选区或增大搜索半径。');
+      setStatus(
+        fixedLoopSamples !== null
+          ? '未找到有效接缝：定长周期下可搜索范围为空，请调整选区、增大搜索半径或解除定长约束。'
+          : '未找到有效接缝：请调整选区或增大搜索半径。',
+      );
       return found;
     }
     const best = found[0];
     const dStart = ((best.startSample - startS) / sr) * 1000;
     const dEnd = ((best.endSample - endS) / sr) * 1000;
+    if (fixedLoopSamples !== null) {
+      // 定长模式：起止点等量平移，仅需报告一个平移量
+      setStatus(
+        `定长搜索（${fixedLoopSamples.toLocaleString()} 采样点，起止点等量平移）：` +
+          `找到 ${found.length} 个候选接缝（起止点相距不足 10 ms 的已去重，按代价排序）。` +
+          ` #1 平移 ${dStart >= 0 ? '+' : ''}${dStart.toFixed(1)} ms，代价 ${best.cost.toFixed(4)}。` +
+          ` 点击候选列表可切换试听与导出目标。`,
+      );
+      return found;
+    }
     setStatus(
       `找到 ${found.length} 个候选接缝（起止点相距不足 10 ms 的已去重，按代价排序）。` +
         ` #1 起点移动 ${dStart >= 0 ? '+' : ''}${dStart.toFixed(1)} ms，` +
@@ -157,7 +275,7 @@ export default function App() {
         ` 点击候选列表可切换试听与导出目标。`,
     );
     return found;
-  }, [buffer, selection, radiusMs]);
+  }, [buffer, selection, radiusMs, fixedLoopSamples]);
 
   const playOriginal = useCallback(async () => {
     if (!buffer || !selection) {
@@ -256,7 +374,28 @@ export default function App() {
         crossfadeMs,
         slopeWindowSamples: SLOPE_WINDOW,
         slopeWeight: SLOPE_WEIGHT,
+        // 定长搜索标记：周期校准吸附后为 true，起止点等量平移、循环长度固定
+        fixedLengthSearch: fixedLoopSamples !== null,
+        fixedLoopSamples,
       },
+      // 周期校准：吸附的周期、置信度与全部周期候选；未校准时为 null
+      periodCalibration: appliedPeriod
+        ? {
+            applied: true,
+            fixedLengthSearch: true,
+            periodSec: roundTo(appliedPeriod.periodSamples / sr, 6),
+            periodSamples: Math.round(appliedPeriod.periodSamples),
+            confidence: roundTo(appliedPeriod.confidence, 4),
+            correlation: roundTo(appliedPeriod.correlation, 4),
+            candidates: periodCandidates.map((c, i) => ({
+              rank: i + 1,
+              periodSec: roundTo(c.periodSamples / sr, 6),
+              periodSamples: Math.round(c.periodSamples),
+              confidence: roundTo(c.confidence, 4),
+              correlation: roundTo(c.correlation, 4),
+            })),
+          }
+        : null,
       seamCost: seam.cost,
       // 接缝频谱诊断：参数与结果（差值矩阵为 头 − 尾，帧按与接缝的距离配对）
       spectrumDiagnostics: spectrum
@@ -298,8 +437,11 @@ export default function App() {
     a.download = `${fileName.replace(/\.[^.]+$/, '') || 'loop'}.loop.json`;
     a.click();
     URL.revokeObjectURL(url);
-    setStatus(`已导出 JSON：候选 #${selectedIdx + 1} 的起止时间、全部候选列表、搜索参数与接缝频谱诊断。`);
-  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs]);
+    setStatus(
+      `已导出 JSON：候选 #${selectedIdx + 1} 的起止时间、全部候选列表、搜索参数与接缝频谱诊断` +
+        (appliedPeriod ? '，含周期校准（周期、置信度与定长搜索标记）。' : '。'),
+    );
+  }, [buffer, selection, seam, candidates, selectedIdx, fileName, radiusMs, crossfadeMs, spectrum, specWindowMs, appliedPeriod, periodCandidates, fixedLoopSamples]);
 
   const exportWav = useCallback(() => {
     if (!buffer || !seam) return;
@@ -343,7 +485,7 @@ export default function App() {
     <div className="app">
       <header className="header">
         <h1>无缝循环接缝查找器</h1>
-        <p>本地浏览器内分析音频，在粗选边界附近搜索幅值与短窗斜率最连续的接缝候选（Top 5 按代价排序），可点选对比试听、查看接缝频谱诊断热图并导出参数。</p>
+        <p>本地浏览器内分析音频：可先做周期校准吸附选区终点（定长接缝搜索），在粗选边界附近搜索幅值与短窗斜率最连续的接缝候选（Top 5 按代价排序），可点选对比试听、查看接缝频谱诊断热图并导出参数。</p>
       </header>
 
       <section
@@ -374,6 +516,69 @@ export default function App() {
             <span><i className="swatch swatch-handle" /> 选区边界（可拖动）</span>
             <span><i className="swatch swatch-seam" /> 候选接缝（编号与列表对应，高亮为选中）</span>
           </div>
+
+          <section className="panel period">
+            <h2>周期校准</h2>
+            <p className="period-desc">
+              将整段音频混合为单声道并提取短时能量变化包络，在可用音频范围内对选区长度 1/2～2 倍的滞后做归一化自相关，
+              抑制整数倍/分频重复峰后给出前 3 个周期候选及置信度。点击候选把选区终点吸附到该周期，
+              此后接缝搜索改为定长约束（起止点等量平移，周期样本数不变）；短音频、静音或无显著峰时不强制吸附。
+            </p>
+            <div className="transport">
+              <button className="primary" onClick={analyzePeriod} disabled={!selection}>分析周期</button>
+              {appliedPeriod && <button onClick={releasePeriod}>解除定长约束</button>}
+            </div>
+            {periodFailure && (
+              <p className="clamp-note">
+                {periodFailure === 'too-short' &&
+                  '音频太短：可用范围内无法搜索选区长度 1/2～2 倍的滞后，未强制吸附，已保留原选区。'}
+                {periodFailure === 'silence' &&
+                  '音频接近静音：能量变化包络过低，无法进行周期校准，未强制吸附，已保留原选区。'}
+                {periodFailure === 'no-peak' &&
+                  '无显著周期峰：归一化自相关低于阈值，未强制吸附，已保留原选区。'}
+              </p>
+            )}
+            {periodCandidates.length > 0 && (
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>周期</th>
+                    <th>采样点</th>
+                    <th>置信度</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {periodCandidates.map((c, i) => {
+                    const applied = appliedPeriod === c;
+                    return (
+                      <tr key={i} className={applied ? 'selected' : ''} onClick={() => applyPeriod(c)}>
+                        <td><span className="rank">{i + 1}</span></td>
+                        <td>{((c.periodSamples / sr) * 1000).toFixed(1)} ms</td>
+                        <td>{Math.round(c.periodSamples).toLocaleString()}</td>
+                        <td>
+                          <span className="conf">
+                            <span className="conf-fill" style={{ width: `${Math.round(c.confidence * 100)}%` }} />
+                          </span>
+                          {(c.confidence * 100).toFixed(0)}%
+                        </td>
+                        <td className="row-state">{applied ? '✓ 已吸附（再点解除）' : '点击吸附到该周期'}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+            {appliedPeriod && (
+              <p className="period-note">
+                定长约束生效中：循环长度固定为 {Math.round(appliedPeriod.periodSamples).toLocaleString()} 采样点
+                （{((appliedPeriod.periodSamples / sr) * 1000).toFixed(1)} ms，
+                置信度 {(appliedPeriod.confidence * 100).toFixed(0)}%），
+                接缝搜索时起点与终点等量平移；搜索半径、候选去重与试听流程不变。
+              </p>
+            )}
+          </section>
 
           <section className="panel">
             <div className="sliders">
@@ -506,6 +711,7 @@ export default function App() {
             {seam && (
               <p className="cost">
                 接缝代价：{seam.cost.toFixed(4)}（候选 #{selectedIdx + 1}，越小越平滑） · 淡化 {crossfadeMs} ms · 半径 {radiusMs} ms
+                {fixedLoopSamples !== null && ` · 定长 ${fixedLoopSamples.toLocaleString()} 采样`}
               </p>
             )}
           </section>

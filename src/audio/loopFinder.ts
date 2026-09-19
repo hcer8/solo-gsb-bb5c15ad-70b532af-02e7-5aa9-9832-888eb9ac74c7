@@ -9,6 +9,12 @@ export interface SeamSearchOptions {
   slopeWeight?: number;
   /** 允许的最短循环长度（采样点），默认 64 */
   minLoopSamples?: number;
+  /**
+   * 定长约束（采样点）：设置后循环长度固定为该值，终点 = 起点 + fixedLoopSamples，
+   * 起止点必须等量平移，搜索退化为对起点的一维搜索（搜索半径、候选去重不变）；
+   * 缺省为自由二维搜索
+   */
+  fixedLoopSamples?: number;
 }
 
 export interface CandidateSearchOptions extends SeamSearchOptions {
@@ -45,6 +51,10 @@ export interface SeamResult {
  * 避免列表被同一个低谷占满；再对每个粗候选在 ±stride 内逐采样点细化。
  * 细化后再次去重并按代价排序，返回前 maxCandidates 个结果
  * （按代价升序，第 0 个即最优接缝）。
+ *
+ * 定长模式（fixedLoopSamples）：循环长度固定，终点 = 起点 + fixedLoopSamples，
+ * 起止点等量平移，搜索退化为对起点的一维搜索（粗网格与细化同策略），
+ * 去重与排序逻辑不变；定长周期超出可搜索范围时返回空数组。
  */
 export function findCandidateSeams(
   audio: AudioDataLike,
@@ -84,10 +94,23 @@ export function findCandidateSeams(
   const lo = W + 1;
   const hi = len - W - 2;
   const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(v, b));
+  const fixed =
+    options.fixedLoopSamples != null && Number.isFinite(options.fixedLoopSamples)
+      ? Math.max(minLoop, Math.round(options.fixedLoopSamples))
+      : null;
   const sLo = clamp(Math.round(roughStart) - r, lo, hi);
-  const sHi = clamp(Math.round(roughStart) + r, lo, hi);
-  const eLo = clamp(Math.round(roughEnd) - r, lo + 1, len - 1);
-  const eHi = clamp(Math.round(roughEnd) + r, lo + 1, len - 1);
+  let sHi = clamp(Math.round(roughStart) + r, lo, hi);
+  let eLo: number;
+  let eHi: number;
+  if (fixed !== null) {
+    // 定长约束：终点由起点唯一确定（e = s + fixed），只需保证 e ≤ len − 1
+    sHi = Math.min(sHi, len - 1 - fixed);
+    eLo = sLo + fixed;
+    eHi = sHi + fixed;
+  } else {
+    eLo = clamp(Math.round(roughEnd) - r, lo + 1, len - 1);
+    eHi = clamp(Math.round(roughEnd) + r, lo + 1, len - 1);
+  }
 
   const sCount = sHi - sLo + 1;
   const eCount = eHi - eLo + 1;
@@ -130,13 +153,20 @@ export function findCandidateSeams(
   };
 
   // ---- 第一级：粗网格搜索，收集全部命中 ----
-  const totalPairs = sCount * eCount;
+  const totalPairs = fixed !== null ? sCount : sCount * eCount;
   const stride = Math.max(1, Math.round(Math.sqrt(totalPairs / 300_000)));
   const hitCost: number[] = [];
   const hitS: number[] = [];
   const hitE: number[] = [];
   for (let i = 0; i < sCount; i += stride) {
     const s = sLo + i;
+    if (fixed !== null) {
+      // 定长约束：终点 = 起点 + fixed（特征索引与起点相同）
+      hitCost.push(pairCost(i, i));
+      hitS.push(s);
+      hitE.push(s + fixed);
+      continue;
+    }
     for (let j = 0; j < eCount; j += stride) {
       const e = eLo + j;
       if (e - s < minLoop) continue;
@@ -196,6 +226,18 @@ export function findCandidateSeams(
     for (const p of pool) {
       const iFrom = Math.max(sLo, p.startSample - stride);
       const iTo = Math.min(sHi, p.startSample + stride);
+      if (fixed !== null) {
+        // 定长约束：仅沿起点一维细化，终点同步平移
+        for (let s = iFrom; s <= iTo; s++) {
+          const c = pairCost(s - sLo, s - sLo);
+          if (c < p.cost) {
+            p.cost = c;
+            p.startSample = s;
+            p.endSample = s + fixed;
+          }
+        }
+        continue;
+      }
       const jFrom = Math.max(eLo, p.endSample - stride);
       const jTo = Math.min(eHi, p.endSample + stride);
       for (let s = iFrom; s <= iTo; s++) {

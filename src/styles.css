@@ -262,6 +262,80 @@ button.active {
   color: #9aa7bd;
 }
 
+/* 周期校准面板 */
+.period h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.period-desc {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
+.period table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  margin-top: 12px;
+}
+
+.period th,
+.period td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #232c40;
+}
+
+.period th {
+  color: #9aa7bd;
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.period tbody tr {
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.period tbody tr:hover {
+  background: rgba(91, 141, 239, 0.08);
+}
+
+.period tbody tr.selected {
+  background: rgba(47, 210, 125, 0.1);
+}
+
+.period tbody tr.selected td {
+  color: #7fe6b0;
+}
+
+.period-note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: #7fe6b0;
+}
+
+.conf {
+  display: inline-block;
+  width: 56px;
+  height: 8px;
+  background: #1b2338;
+  border: 1px solid #2c3852;
+  border-radius: 4px;
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 8px;
+}
+
+.conf-fill {
+  display: block;
+  height: 100%;
+  background: #2fd27d;
+}
+
 /* 接缝频谱检查面板 */
 .spectrum h2 {
   margin: 0 0 8px;
